@@ -33,7 +33,7 @@ module tt_um_pin_core (
     integer i;
     initial begin
         for (i = 0; i < DEPTH; i = i + 1) imem[i] = 16'h0000;   // unused words = NOP
-        $readmemh("uart_tx.hex", imem);
+        $readmemh("test.hex", imem);
     end
 
     // ---- state

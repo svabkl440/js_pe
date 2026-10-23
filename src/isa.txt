@@ -1,0 +1,53 @@
+[15:12] opcode
+[11:0]  operands
+
+
+Opcode	Name	Used operand bits				Unused
+0	NOP	none						[11:0]
+1	SET	[3] value, [2:0] pin				[11:4]
+2	OUT	[3] direction, [2:0] pin			[11:4]
+3	IN	[4] direction, [3:0] pin			[11:5]
+4	PULL	none						[11:0]
+5	PUSH	none						[11:0]
+6	DELAY	[7:0] n						[11:8]
+7	LDX	[7:0] value					[11:8]
+8	LDY	[7:0] value					[11:8]
+9	WAIT	[4] value, [3:0] pin				[11:5]
+A	JMP	[11:10] condition, [9:6] pin, [5:0] address	none
+
+
+Pin numbers come in two sizes. Output pins are 0 to 7 (3 bits) and map to uo_out[7:0]. 
+Input pins are 0 to 15 (4 bits): 0 to 7 are ui_in[7:0] and 8 to 15 are uio_in[7:0].
+
+
+What each instruction does
+
+1. NOP (0000 ...) does nothing for one clock.
+
+2. SET pin, value (0001 0000 0000 vppp) drives one output pin to 0 or 1 and leaves the others alone. Bit 3 is the value and bits 2:0 pick the pin. For example, SET 0,1 is 0x1008.
+
+3. OUT pin [,MSB] (0010 0000 0000 dppp) shifts one bit of SR (the shift register) onto an output pin. With bit 3 = 0, it sends SR[0] and shifts SR right (LSB first, used by UART). With bit 3 = 1, it sends SR[7] and shifts SR left (MSB first, used by SPI). Zeros fill the vacated bit. For example, OUT 3,MSB is 0x200B.
+
+4. IN pin [,MSB] (0011 0000 000d pppp) is the reverse. It reads an input pin (0 to 15) and shifts the bit into SR. With bit 4 = 0, the bit enters at the top and SR shifts right (LSB first). With bit 4 = 1, the bit enters at the bottom and SR shifts left (MSB first). It is how a receiver collects a byte one bit at a time.
+
+5. PULL (0100 ...) loads SR in parallel with the whole ui_in byte (input pins 0 to 7). It is how firmware picks up the byte the host wants to send.
+
+6. PUSH (0101 ...) is the reverse: it writes SR to all 8 output pins at once.
+
+7. DELAY n (0110 0000 nnnn nnnn) takes exactly n+1 clocks, with n from 0 to 255. DELAY 0 takes 1 clock, like a NOP. DELAY 84 is 0x6054, which is the bit-timing delay in the UART.
+
+8. LDX n / LDY n (0111 / 1000, then 0000 nnnn nnnn) load an 8-bit constant into the scratch register X or Y. They are used as loop counters.
+
+9. WAIT pin, value (1001 0000 000v pppp) stalls until the chosen input pin equals the value, then moves on. If the condition is already true, it takes 1 clock. For example, WAIT 11,1 is 0x901B. It is how firmware waits for a start request or a clock edge.
+
+10. JMP (1010 cc pppp aaaaaa) is the only way to change the flow. The condition cc (bits 11:10) selects:
+
+cc	Written as	Behavior
+00	JMP label	always jump
+01	JMP X-- label	jump if X ≠ 0, then X decrements either way
+10	JMP Y-- label	same, using Y
+11	JMP PIN p, label	jump if input pin p (bits 9:6) is high
+
+The address (bits 5:0) is 0 to 63, the size of the program memory. The pin field is only used when cc = 11.
+
+The decrement happens whether or not the jump is taken, so LDX 7 followed by a loop ending in JMP X-- bit runs the loop body 8 times (X = 7 down to 0).
