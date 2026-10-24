@@ -13,9 +13,7 @@ module tt_um_pin_core (
 );
 
     localparam DEPTH_LOG2 = 6;
-    localparam DEPTH      = 1 << DEPTH_LOG2;
 
-    // Instruction opcodes: instr[15:12]
     localparam [3:0]
         OP_NOP   = 4'h0,
         OP_SET   = 4'h1,
@@ -30,26 +28,7 @@ module tt_um_pin_core (
         OP_JMP   = 4'hA;
 
     // ------------------------------------------------------------
-    // Writable instruction memory
-    // 64 instructions x 16 bits = 128 bytes.
-    //
-    // There is deliberately no $readmemh here.
-    // Firmware is written through the runtime loader.
-    // ------------------------------------------------------------
-    reg [15:0] imem [0:DEPTH-1];
-
-    // ------------------------------------------------------------
-    // Loader interface
-    //
-    // ui_in[7:0] = byte being loaded
-    // uio_in[7]  = LOAD_MODE
-    // uio_in[6]  = LOAD_STROBE
-    //
-    // LOAD_MODE=1: accept firmware bytes; CPU is held.
-    // LOAD_MODE=0: execute from instruction address zero.
-    //
-    // Each rising edge of synchronized LOAD_STROBE accepts one
-    // byte. Two bytes are combined into one instruction.
+    // Loader synchronizers
     // ------------------------------------------------------------
     reg load_mode_meta;
     reg load_mode_sync;
@@ -59,16 +38,18 @@ module tt_um_pin_core (
     reg load_strobe_sync;
     reg load_strobe_prev;
 
-    reg [6:0] load_byte_addr;  // Byte address 0..127
-    reg [7:0] load_low_byte;
+    reg [6:0] load_byte_addr;
     reg       load_full;
     reg       loader_armed;
 
     wire load_mode_pin   = uio_in[7];
     wire load_strobe_pin = uio_in[6];
 
+    wire load_strobe_rise =
+        load_strobe_sync && !load_strobe_prev;
+
     // ------------------------------------------------------------
-    // CPU state
+    // CPU registers
     // ------------------------------------------------------------
     reg [DEPTH_LOG2-1:0] pc;
     reg [7:0] sr;
@@ -78,16 +59,130 @@ module tt_um_pin_core (
     reg       dly_active;
     reg [7:0] dly_cnt;
 
-    wire [15:0] pins  = {uio_in, ui_in};
-    wire [15:0] instr = imem[pc];
+    // Indicates that the synchronous memory has returned a
+    // valid instruction after starting or restarting execution.
+    reg instr_valid;
+
+    wire [15:0] pins = {uio_in, ui_in};
+
+    // ------------------------------------------------------------
+    // Program memory
+    // ------------------------------------------------------------
+    wire        mem_re;
+    wire [5:0]  mem_raddr;
+    wire [15:0] mem_rdata;
+
+    wire        mem_we;
+    wire [6:0]  mem_wbyte_addr;
+    wire [7:0]  mem_wdata;
+
+    pe_store #(
+        .AW(6)
+    ) program_store (
+        .clk(clk),
+
+        .re(mem_re),
+        .raddr(mem_raddr),
+        .rdata(mem_rdata),
+
+        .we(mem_we),
+        .wbyte_addr(mem_wbyte_addr),
+        .wdata(mem_wdata)
+    );
+
+    // Read the next instruction while executing the current one.
+    assign mem_re =
+        rst_n && loader_armed && !load_mode_sync;
+
+    // ------------------------------------------------------------
+    // Current instruction and opcode
+    // ------------------------------------------------------------
+    wire [15:0] instr = mem_rdata;
     wire [3:0]  op    = instr[15:12];
 
     // ------------------------------------------------------------
-    // Loader + CPU
+    // Next-PC calculation
+    //
+    // The next instruction address is calculated from the
+    // instruction currently being executed. The memory reads
+    // that address on the same clock edge that executes instr.
+    // ------------------------------------------------------------
+    reg [5:0] next_pc;
+
+    always @* begin
+        next_pc = pc + 1'b1;
+
+        case (op)
+
+            OP_DELAY: begin
+                if (!dly_active) begin
+                    if (instr[7:0] != 0)
+                        next_pc = pc;
+                end else if (dly_cnt != 1) begin
+                    next_pc = pc;
+                end
+            end
+
+            OP_WAIT: begin
+                if (pins[instr[3:0]] != instr[4])
+                    next_pc = pc;
+            end
+
+            OP_JMP: begin
+                case (instr[11:10])
+
+                    // Unconditional jump
+                    2'd0: begin
+                        next_pc = instr[5:0];
+                    end
+
+                    // Jump if X is nonzero
+                    2'd1: begin
+                        if (x != 0)
+                            next_pc = instr[5:0];
+                    end
+
+                    // Jump if Y is nonzero
+                    2'd2: begin
+                        if (y != 0)
+                            next_pc = instr[5:0];
+                    end
+
+                    // Jump if selected input is high
+                    2'd3: begin
+                        if (pins[instr[9:6]])
+                            next_pc = instr[5:0];
+                    end
+
+                endcase
+            end
+
+            default: begin
+                // Normal instruction: advance to the next word.
+            end
+
+        endcase
+    end
+
+    // During pipeline startup, fetch the current PC.
+    // Once instr_valid is true, fetch next_pc while executing instr.
+    assign mem_raddr = instr_valid ? next_pc : pc;
+
+    // ------------------------------------------------------------
+    // Firmware-loader write port
+    // ------------------------------------------------------------
+    assign mem_we =
+        rst_n && load_mode_sync &&
+        load_strobe_rise && !load_full;
+
+    assign mem_wbyte_addr = load_byte_addr;
+    assign mem_wdata      = ui_in;
+
+    // ------------------------------------------------------------
+    // Loader and CPU
     // ------------------------------------------------------------
     always @(posedge clk) begin
         if (!rst_n) begin
-            // Synchronizers
             load_mode_meta   <= 1'b0;
             load_mode_sync   <= 1'b0;
             load_mode_prev   <= 1'b0;
@@ -96,24 +191,23 @@ module tt_um_pin_core (
             load_strobe_sync <= 1'b0;
             load_strobe_prev <= 1'b0;
 
-            // Loader state
             load_byte_addr <= 7'd0;
-            load_low_byte  <= 8'd0;
             load_full      <= 1'b0;
             loader_armed   <= 1'b0;
 
-            // CPU state
-            pc         <= 0;
-            sr         <= 0;
-            x          <= 0;
-            y          <= 0;
-            out_reg    <= 8'hFF;
-            dly_active <= 0;
-            dly_cnt    <= 0;
+            pc          <= 6'd0;
+            instr_valid <= 1'b0;
 
-            // imem is intentionally not reset. The loader fills it.
+            sr         <= 8'd0;
+            x          <= 8'd0;
+            y          <= 8'd0;
+            out_reg    <= 8'hFF;
+
+            dly_active <= 1'b0;
+            dly_cnt    <= 8'd0;
+
         end else begin
-            // Synchronize the two control inputs to clk.
+            // Synchronize loader inputs.
             load_mode_meta   <= load_mode_pin;
             load_mode_sync   <= load_mode_meta;
             load_mode_prev   <= load_mode_sync;
@@ -123,147 +217,139 @@ module tt_um_pin_core (
             load_strobe_prev <= load_strobe_sync;
 
             // ----------------------------------------------------
-            // LOAD MODE
+            // Firmware loading
             // ----------------------------------------------------
             if (load_mode_sync) begin
                 loader_armed <= 1'b1;
 
-                // On entry into LOAD MODE, start at byte address 0.
                 if (!load_mode_prev) begin
                     load_byte_addr <= 7'd0;
-                    load_low_byte  <= 8'd0;
                     load_full      <= 1'b0;
                 end
 
-                // Keep the CPU stopped while firmware is loading.
-                pc         <= 0;
-                sr         <= 0;
-                x          <= 0;
-                y          <= 0;
-                out_reg    <= 8'hFF;
-                dly_active <= 0;
-                dly_cnt    <= 0;
-
-                // Accept exactly one byte per synchronized
-                // rising edge of LOAD_STROBE.
-                if (load_strobe_sync &&
-                    !load_strobe_prev &&
-                    !load_full) begin
-
-                    if (!load_byte_addr[0]) begin
-                        // Even byte address: save low byte.
-                        load_low_byte <= ui_in;
-                    end else begin
-                        // Odd byte address: save high byte and
-                        // commit the complete instruction.
-                        imem[load_byte_addr[6:1]]
-                            <= {ui_in, load_low_byte};
-
-                        if (load_byte_addr == 7'd127)
-                            load_full <= 1'b1;
-                    end
+                if (load_strobe_rise && !load_full) begin
+                    if (load_byte_addr == 7'd127)
+                        load_full <= 1'b1;
 
                     load_byte_addr <= load_byte_addr + 1'b1;
                 end
 
+                // Stop execution and invalidate any old fetch.
+                pc          <= 6'd0;
+                instr_valid <= 1'b0;
+
+                sr         <= 8'd0;
+                x          <= 8'd0;
+                y          <= 8'd0;
+                out_reg    <= 8'hFF;
+
+                dly_active <= 1'b0;
+                dly_cnt    <= 8'd0;
+
             // ----------------------------------------------------
-            // EXECUTION MODE
+            // Execution
             // ----------------------------------------------------
             end else if (loader_armed) begin
-                pc <= pc + 1'b1;
 
-                case (op)
-                    OP_NOP: begin
-                        // No operation.
-                    end
+                if (!instr_valid) begin
+                    // Prime the synchronous memory with instr[0].
+                    // Do not execute the previous memory output.
+                    pc          <= 6'd0;
+                    instr_valid <= 1'b1;
 
-                    OP_SET: begin
-                        out_reg[instr[2:0]] <= instr[3];
-                    end
+                end else begin
+                    // The memory simultaneously fetches next_pc.
+                    // Execute the instruction already in mem_rdata.
+                    pc <= next_pc;
 
-                    OP_OUT: begin
-                        // instr[3]: 0 = LSB first, 1 = MSB first
-                        out_reg[instr[2:0]]
-                            <= instr[3] ? sr[7] : sr[0];
+                    case (op)
 
-                        sr <= instr[3]
-                            ? {sr[6:0], 1'b0}
-                            : {1'b0, sr[7:1]};
-                    end
-
-                    OP_IN: begin
-                        sr <= instr[4]
-                            ? {sr[6:0], pins[instr[3:0]]}
-                            : {pins[instr[3:0]], sr[7:1]};
-                    end
-
-                    OP_PULL: begin
-                        sr <= ui_in;
-                    end
-
-                    OP_PUSH: begin
-                        out_reg <= sr;
-                    end
-
-                    OP_DELAY: begin
-                        if (!dly_active) begin
-                            if (instr[7:0] != 0) begin
-                                dly_active <= 1'b1;
-                                dly_cnt    <= instr[7:0];
-                                pc         <= pc;
-                            end
-                        end else if (dly_cnt == 1) begin
-                            dly_active <= 1'b0;
-                        end else begin
-                            dly_cnt <= dly_cnt - 1'b1;
-                            pc      <= pc;
+                        OP_NOP: begin
+                            // No operation.
                         end
-                    end
 
-                    OP_LDX: begin
-                        x <= instr[7:0];
-                    end
+                        OP_SET: begin
+                            out_reg[instr[2:0]] <= instr[3];
+                        end
 
-                    OP_LDY: begin
-                        y <= instr[7:0];
-                    end
+                        OP_OUT: begin
+                            out_reg[instr[2:0]] <=
+                                instr[3] ? sr[7] : sr[0];
 
-                    OP_WAIT: begin
-                        if (pins[instr[3:0]] != instr[4])
-                            pc <= pc;
-                    end
+                            sr <= instr[3]
+                                ? {sr[6:0], 1'b0}
+                                : {1'b0, sr[7:1]};
+                        end
 
-                    OP_JMP: begin
-                        case (instr[11:10])
-                            2'd0: begin
-                                pc <= instr[5:0];
+                        OP_IN: begin
+                            sr <= instr[4]
+                                ? {sr[6:0], pins[instr[3:0]]}
+                                : {pins[instr[3:0]], sr[7:1]};
+                        end
+
+                        OP_PULL: begin
+                            sr <= ui_in;
+                        end
+
+                        OP_PUSH: begin
+                            out_reg <= sr;
+                        end
+
+                        OP_DELAY: begin
+                            if (!dly_active) begin
+                                if (instr[7:0] != 0) begin
+                                    dly_active <= 1'b1;
+                                    dly_cnt    <= instr[7:0];
+                                end
+                            end else if (dly_cnt == 1) begin
+                                dly_active <= 1'b0;
+                            end else begin
+                                dly_cnt <= dly_cnt - 1'b1;
                             end
+                        end
 
-                            2'd1: begin
-                                if (x != 0)
-                                    pc <= instr[5:0];
-                                x <= x - 1'b1;
-                            end
+                        OP_LDX: begin
+                            x <= instr[7:0];
+                        end
 
-                            2'd2: begin
-                                if (y != 0)
-                                    pc <= instr[5:0];
-                                y <= y - 1'b1;
-                            end
+                        OP_LDY: begin
+                            y <= instr[7:0];
+                        end
 
-                            2'd3: begin
-                                if (pins[instr[9:6]])
-                                    pc <= instr[5:0];
-                            end
-                        endcase
-                    end
+                        OP_WAIT: begin
+                            // next_pc holds PC while the condition
+                            // is not satisfied.
+                        end
 
-                    default: begin
-                        // Unknown opcodes behave like NOP.
-                    end
-                endcase
+                        OP_JMP: begin
+                            case (instr[11:10])
+
+                                2'd0: begin
+                                    // Unconditional jump.
+                                end
+
+                                2'd1: begin
+                                    x <= x - 1'b1;
+                                end
+
+                                2'd2: begin
+                                    y <= y - 1'b1;
+                                end
+
+                                2'd3: begin
+                                    // Conditional pin jump.
+                                end
+
+                            endcase
+                        end
+
+                        default: begin
+                            // Unknown opcodes behave like NOP.
+                        end
+
+                    endcase
+                end
             end
-            // Before the first load, keep the CPU stopped.
         end
     end
 
