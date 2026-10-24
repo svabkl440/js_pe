@@ -2,6 +2,14 @@
 [11:0]  operands
 
 
+TIMING (instruction slots)
+
+Instruction memory is an 8-bit synchronous SRAM, so each 16-bit instruction is fetched as two
+byte reads. Every instruction therefore takes exactly one SLOT = 2 clk, and everything below that
+says "clock" or "cycle" means one slot (2 clk). Taken jumps and stalls cost no extra fetch bubble.
+Inputs (IN, WAIT, JMP PIN, PULL) are sampled once per slot, so an external pulse must be held
+for at least 2 clk to be guaranteed to be seen. Output pins change at the end of the slot.
+
 Opcode	Name	Used operand bits				Unused
 0	NOP	none						[11:0]
 1	SET	[3] value, [2:0] pin				[11:4]

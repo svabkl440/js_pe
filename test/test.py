@@ -5,7 +5,10 @@ import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
 
-CLKS_PER_BIT = 87
+# The instruction memory is an 8-bit synchronous SRAM, so every instruction
+# takes exactly CLKS_PER_INSTR clocks (low byte read + high byte read).
+CLKS_PER_INSTR = 2
+CLKS_PER_BIT = 87 * CLKS_PER_INSTR   # 87 instruction slots per UART bit
 START = 0b0000_1000  # uio_in[3], existing UART start input
 
 LOAD_MODE = 0b1000_0000   # uio_in[7]
@@ -103,9 +106,11 @@ async def wait_for(dut, cond, limit=2000):
 
 
 async def send(dut, byte):
+    # Pins are sampled once per instruction slot, so START must be held
+    # for at least CLKS_PER_INSTR clocks to be guaranteed to be seen.
     dut.ui_in.value = byte
     dut.uio_in.value = START
-    await ClockCycles(dut.clk, 1)
+    await ClockCycles(dut.clk, CLKS_PER_INSTR)
     dut.uio_in.value = 0
 
 
@@ -157,7 +162,7 @@ async def ready_marks_the_frame(dut):
         await ClockCycles(dut.clk, 1)
         n += 1
 
-    assert abs(n - 10 * CLKS_PER_BIT) <= 2, (
+    assert abs(n - 10 * CLKS_PER_BIT) <= CLKS_PER_INSTR, (
         f"frame took {n} clocks"
     )
 
@@ -216,3 +221,81 @@ async def runtime_loader_replaces_program(dut):
         "PASS: loaded program A, replaced it with program B, "
         "and observed both output pins toggle"
     )
+
+
+async def edges(dut, n_clks, bit=0):
+    """Return the clock index of each change on uo_out[bit]."""
+    prev = (int(dut.uo_out.value) >> bit) & 1
+    out = []
+    for i in range(n_clks):
+        await ClockCycles(dut.clk, 1)
+        cur = (int(dut.uo_out.value) >> bit) & 1
+        if cur != prev:
+            out.append(i)
+        prev = cur
+    return out
+
+
+@cocotb.test()
+async def two_clocks_per_instruction(dut):
+    """
+    SET 0,0 / SET 0,1 / JMP 0 is a 3-instruction loop, so pin 0 must
+    toggle every 3 instruction slots = 6 clocks, with the taken JMP costing
+    the same as any other instruction (no fetch bubble).
+    """
+    await reset(dut)
+    await load_words(dut, [0x1000, 0x1008, 0xA000])
+
+    e = await edges(dut, 60)
+    assert len(e) >= 8, f"pin did not toggle: {e}"
+    # Low phase = 1 slot, high phase = 2 slots; compare same-polarity edges.
+    periods = {b - a for a, b in zip(e, e[2:])}
+    assert periods == {3 * CLKS_PER_INSTR}, f"edge periods {periods}"
+
+
+@cocotb.test()
+async def delay_and_loop_counts(dut):
+    """
+    LDX 3 / loop: SET 0,1 / SET 0,0 / DELAY 2 / JMP X-- loop / SET 1,1 / JMP .
+    Checks DELAY n == n+1 slots and that JMP X-- runs the body X+1 times.
+    """
+    await reset(dut)
+    prog = [
+        0x7003,  # 0: LDX 3
+        0x1008,  # 1: SET 0,1
+        0x1000,  # 2: SET 0,0
+        0x6002,  # 3: DELAY 2   (3 slots)
+        0xA401,  # 4: JMP X-- 1
+        0x1009,  # 5: SET 1,1
+        0xA006,  # 6: JMP 6
+    ]
+    await load_words(dut, prog)
+
+    pulses = 0
+    prev = 0
+    for _ in range(400):
+        await ClockCycles(dut.clk, 1)
+        v = int(dut.uo_out.value)
+        if (v & 1) and not prev:
+            pulses += 1
+        prev = v & 1
+    assert pulses == 4, f"loop body ran {pulses} times, expected 4"
+    assert (int(dut.uo_out.value) >> 1) & 1 == 1, "never reached SET 1,1"
+
+    # Slot accounting: SET(1) + SET(1) + DELAY2(3) + JMP(1) = 6 slots / iter,
+    # measured between two consecutive falling edges of pin 0.
+    await load_words(dut, prog)
+    e = await edges(dut, 80)
+    assert e[2] - e[0] == 6 * CLKS_PER_INSTR, f"iteration took {e[2]-e[0]} clks"
+
+
+@cocotb.test()
+async def branch_targets_cross_the_whole_memory(dut):
+    """Fetch all 64 instruction slots and a jump to the last one (addr 63)."""
+    await reset(dut)
+    prog = [0xA000 | 63] + [0x0000] * 62 + [0x1008, 0xA03F]  # 0: JMP 63
+    prog = prog[:64]
+    prog[63] = 0x1008        # 63: SET 0,1
+    await load_words(dut, prog)
+    await ClockCycles(dut.clk, 20)
+    assert int(dut.uo_out.value) & 1 == 1, "did not execute word 63"

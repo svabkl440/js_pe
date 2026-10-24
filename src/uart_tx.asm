@@ -1,10 +1,11 @@
-; UART transmitter, 8N1, LSB first. One bit = 87 clocks (10 MHz / 115200).
+; UART transmitter, 8N1, LSB first. One bit = 87 instruction slots = 174 clk
+; (each slot is 2 clk, see isa.txt), i.e. 115200 baud needs a 20 MHz clk.
 ;
-; Host interface:  put the byte on ui_in, then pulse START (uio_in[3]) high for 1+ clock.
+; Host interface:  put the byte on ui_in, then pulse START (uio_in[3]) high for 2+ clk (pins are sampled once per 2-clk slot).
 ;                  Hold the byte steady until READY drops.
 ; Outputs:         TX = uo_out[0]   READY = uo_out[1] (low while a frame is in flight)
 ;
-; Timing rule: every bit must take exactly 87 cycles, so each bit loop adds up to 87:
+; Timing rule: every bit must take exactly 87 slots, so each bit loop adds up to 87:
 ;   OUT (1) + DELAY 84 (85) + JMP (1) = 87
 
 .equ TX     0
